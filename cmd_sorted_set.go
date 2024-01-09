@@ -18,6 +18,8 @@ func commandsSortedSet(m *Miniredis) {
 	m.srv.Register("ZADD", m.cmdZadd)
 	m.srv.Register("ZCARD", m.cmdZcard)
 	m.srv.Register("ZCOUNT", m.cmdZcount)
+	m.srv.Register("ZDIFF", m.makeCmdZdiff(false))
+	m.srv.Register("ZDIFFSTORE", m.makeCmdZdiff(true))
 	m.srv.Register("ZINCRBY", m.cmdZincrby)
 	m.srv.Register("ZINTER", m.makeCmdZinter(false))
 	m.srv.Register("ZINTERSTORE", m.makeCmdZinter(true))
@@ -281,6 +283,152 @@ func (m *Miniredis) cmdZcount(c *server.Peer, cmd string, args []string) {
 		members = withSSRange(members, opts.min, opts.minIncl, opts.max, opts.maxIncl)
 		c.WriteInt(len(members))
 	})
+}
+
+// ZDIFF
+func (m *Miniredis) makeCmdZdiff(store bool) func(c *server.Peer, cmd string, args []string) {
+	return func(c *server.Peer, cmd string, args []string) {
+		minArgs := 2
+		if store {
+			minArgs++
+		}
+
+		if len(args) < minArgs {
+			setDirty(c)
+			c.WriteError(errWrongNumber(cmd))
+			return
+		}
+		if !m.handleAuth(c) {
+			return
+		}
+		if m.checkPubsub(c, cmd) {
+			return
+		}
+
+		var opts = struct {
+			Store       bool   // if true, this is ZDIFFSTORE
+			Destination string // only relevant if Store is true
+			Keys        []string
+			WithScores  bool // only for ZDIFF
+		}{
+			Store: store,
+		}
+
+		if store {
+			opts.Destination = args[0]
+			args = args[1:]
+		}
+
+		numKeys, err := strconv.Atoi(args[0])
+		if err != nil {
+			setDirty(c)
+			c.WriteError(msgInvalidInt)
+			return
+		}
+		args = args[1:]
+		if len(args) < numKeys {
+			setDirty(c)
+			c.WriteError(msgSyntaxError)
+			return
+		}
+		if numKeys <= 0 {
+			setDirty(c)
+			c.WriteError("ERR at least 1 input key is needed for ZDIFF/ZDIFFSTORE")
+			return
+		}
+		opts.Keys = args[:numKeys]
+		args = args[numKeys:]
+
+		for len(args) > 0 {
+			switch strings.ToLower(args[0]) {
+			case "withscores":
+				if store {
+					setDirty(c)
+					c.WriteError(msgSyntaxError)
+					return
+				}
+				opts.WithScores = true
+				args = args[1:]
+			default:
+				setDirty(c)
+				c.WriteError(msgSyntaxError)
+				return
+			}
+		}
+
+		// Start with the elements from the first set, then remove those present in the following sets.
+		// This is like "DIFF Algorithm 2" from redis.
+
+		withTx(m, c, func(c *server.Peer, ctx *connCtx) {
+			db := m.db(ctx.selectedDB)
+			if opts.Store {
+				db.del(opts.Destination, true)
+			}
+
+			getSet := func(key string) map[string]float64 {
+				if !db.exists(key) {
+					return map[string]float64{}
+				}
+
+				switch db.t(key) {
+				case "set":
+					set := map[string]float64{}
+					for elem := range db.setKeys[key] {
+						set[elem] = 1.0
+					}
+					return set
+
+				case "zset":
+					return db.sortedSet(key)
+
+				default:
+					c.WriteError(msgWrongType)
+					return nil
+				}
+			}
+
+			first := getSet(opts.Keys[0])
+			if first == nil {
+				return
+			}
+
+			sset := sortedSet(make(map[string]float64, len(first)))
+			for k, v := range first {
+				sset.set(v, k)
+			}
+
+			for _, key := range opts.Keys[1:] {
+				set := getSet(key)
+				if set == nil {
+					return
+				}
+
+				for elem := range set {
+					delete(sset, elem)
+				}
+			}
+
+			if opts.Store {
+				// ZDIFFSTORE mode
+				db.ssetSet(opts.Destination, sset)
+				c.WriteInt(len(sset))
+				return
+			}
+
+			// ZDIFF mode
+			size := len(sset)
+			if opts.WithScores {
+				size *= 2
+			}
+			c.WriteLen(size)
+			for _, elem := range sset.byScore(asc) {
+				c.WriteBulk(elem.member)
+				if opts.WithScores {
+					c.WriteFloat(elem.score)
+				}
+			}
+		})
+	}
 }
 
 // ZINCRBY

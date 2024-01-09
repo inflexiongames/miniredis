@@ -1895,6 +1895,42 @@ func TestZinter(t *testing.T) {
 	// it's the same code as ZINTERSTORE, so see TestZinterstore()
 }
 
+func TestZdiff(t *testing.T) {
+	s, err := Run()
+	ok(t, err)
+	defer s.Close()
+	c, err := proto.Dial(s.Addr())
+	ok(t, err)
+	defer c.Close()
+
+	s.ZAdd("zset1", 1.0, "one")
+	s.ZAdd("zset1", 2.0, "two")
+	s.ZAdd("zset1", 3.0, "three")
+	s.ZAdd("zset2", 1.0, "one")
+	s.ZAdd("zset2", 2.0, "two")
+
+	// Simple case
+	{
+		mustDo(t, c,
+			"ZDIFF", "2", "zset1", "zset2", "WITHSCORES",
+			proto.Strings("three", "3"),
+		)
+	}
+
+	// Diff against no other keys returns the original
+	{
+		mustDo(t, c,
+			"ZDIFF", "1", "zset1",
+			proto.Strings("one", "two", "three"),
+		)
+
+		mustDo(t, c,
+			"ZDIFF", "1", "zset1", "WITHSCORES",
+			proto.Strings("one", "1", "two", "2", "three", "3"),
+		)
+	}
+}
+
 func TestZinterstore(t *testing.T) {
 	s, err := Run()
 	ok(t, err)
