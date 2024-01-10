@@ -361,9 +361,6 @@ func (m *Miniredis) makeCmdZdiff(store bool) func(c *server.Peer, cmd string, ar
 
 		withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 			db := m.db(ctx.selectedDB)
-			if opts.Store {
-				db.del(opts.Destination, true)
-			}
 
 			getSet := func(key string) map[string]float64 {
 				if !db.exists(key) {
@@ -406,6 +403,13 @@ func (m *Miniredis) makeCmdZdiff(store bool) func(c *server.Peer, cmd string, ar
 				for elem := range set {
 					delete(sset, elem)
 				}
+			}
+
+			// Don't delete our destination until we've read to ensure we can still get the value in the
+			// case where the destination is one of the source keys.  Is this necessary?
+
+			if opts.Store {
+				db.del(opts.Destination, true)
 			}
 
 			if opts.Store {
